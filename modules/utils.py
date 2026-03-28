@@ -16,6 +16,14 @@ from config import (
     BSCSCAN_BASE, DEXSCREENER_BASE
 )
 
+# Re-export for use in modules
+__all__ = [
+    "HELIUS_API_KEY", "HELIUS_API_BASE", "HELIUS_BASE",
+    "ETHERSCAN_BASE", "ETHERSCAN_API_KEY",
+    "BSCSCAN_BASE", "BSCSCAN_API_KEY",
+    "get", "post"
+]
+
 # ── Claude client ─────────────────────────────────────────────────────────────
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
