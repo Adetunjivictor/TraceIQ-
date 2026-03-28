@@ -1,17 +1,17 @@
 """
-TraceIQ — Top Wallets Module
-/top → paste contract → find 80-100% win rate wallets active 7-20 days
+TraceIQ — Top Wallets Module (v2)
+/top → token contract → top 10 traders by activity and profitability
+Uses DexScreener (free) + Helius + Etherscan
 """
 
 import asyncio
 from modules.utils import (
-    detect_chain, days_since, short_addr, fmt_usd, fmt_pct,
-    birdeye_token_traders, birdeye_token_info,
-    etherscan_token_transfers, etherscan_txlist,
-    dexscreener_token, find_social_links,
-    claude_analyze
+    detect_chain, days_since, short_addr, fmt_usd,
+    helius_transactions, etherscan_token_transfers,
+    dexscreener_token, find_social_links, claude_analyze,
+    get, HELIUS_API_KEY, HELIUS_API_BASE
 )
-from config import MIN_WIN_RATE, MAX_INACTIVE_DAYS, MIN_TRADES, TOP_WALLET_LIMIT
+from config import MAX_INACTIVE_DAYS, TOP_WALLET_LIMIT
 
 
 async def find_top_wallets(contract: str) -> str:
@@ -22,115 +22,161 @@ async def find_top_wallets(contract: str) -> str:
         return await _top_solana(contract)
     elif chain == "evm":
         return await _top_evm(contract)
-    else:
-        return "❌ Invalid contract address. Please paste a valid Solana or EVM token contract."
+    return "Invalid contract address."
 
 
-# ── Solana top wallets ────────────────────────────────────────────────────────
 async def _top_solana(contract: str) -> str:
-    # Fetch token info and traders in parallel
-    token_info, traders, dex_info = await asyncio.gather(
-        birdeye_token_info(contract),
-        birdeye_token_traders(contract),
-        dexscreener_token(contract)
-    )
+    dex_info = await dexscreener_token(contract)
+    token_name   = dex_info.get("baseToken", {}).get("name", "Unknown")
+    token_symbol = dex_info.get("baseToken", {}).get("symbol", "???")
+    price        = dex_info.get("priceUsd", "0")
+    mcap         = dex_info.get("marketCap", 0)
 
-    token_name   = token_info.get("name", "Unknown Token")
-    token_symbol = token_info.get("symbol", "???")
-    price        = token_info.get("price", 0)
-    mcap         = token_info.get("realMc", token_info.get("mc", 0))
-
-    if not traders:
-        return (
-            f"❌ No trader data found for `{short_addr(contract)}`\n\n"
-            "This token may be too new, have low volume, or not indexed yet on Birdeye."
+    # Fetch recent transactions for this token mint via Helius
+    try:
+        data = await get(
+            f"{HELIUS_API_BASE}/addresses/{contract}/transactions",
+            params={"api-key": HELIUS_API_KEY, "limit": 100, "type": "SWAP"}
         )
+        txs = data if isinstance(data, list) else []
+    except Exception:
+        txs = []
 
-    # Filter traders
-    qualified = []
-    for t in traders:
-        win_rate  = float(t.get("winRate", 0))
-        last_time = int(t.get("lastTradeUnixTime", 0))
-        trade_cnt = int(t.get("tradeCount", t.get("numTrade", 0)))
-        days_ago  = days_since(last_time) if last_time else 999
+    if not txs:
+        # Fallback: get token accounts (holders who interacted)
+        try:
+            from modules.utils import post
+            data = await post(
+                f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
+                json={
+                    "jsonrpc": "2.0", "id": 1,
+                    "method": "getSignaturesForAddress",
+                    "params": [contract, {"limit": 100}]
+                }
+            )
+            sigs = data.get("result", [])
+            txs  = [{"feePayer": s.get("memo", ""), "timestamp": s.get("blockTime", 0)} for s in sigs]
+        except Exception:
+            txs = []
 
-        if (
-            win_rate >= MIN_WIN_RATE and
-            days_ago <= MAX_INACTIVE_DAYS and
-            trade_cnt >= MIN_TRADES
-        ):
-            qualified.append({
-                "address":   t.get("address", ""),
-                "win_rate":  win_rate,
-                "days_ago":  days_ago,
-                "trades":    trade_cnt,
-                "pnl":       float(t.get("pnl", t.get("realizedPnl", 0))),
-                "volume":    float(t.get("volume", 0)),
-            })
+    # Aggregate wallets from transactions
+    wallet_activity = {}
+    for tx in txs:
+        # Get the fee payer / signer as the trader
+        trader = tx.get("feePayer", "") or tx.get("accountData", [{}])[0].get("account", "") if isinstance(tx.get("accountData"), list) else ""
+        if not trader or trader == contract:
+            continue
+        ts = tx.get("timestamp", 0)
+        if trader not in wallet_activity:
+            wallet_activity[trader] = {"count": 0, "last_ts": 0}
+        wallet_activity[trader]["count"] += 1
+        if ts > wallet_activity[trader]["last_ts"]:
+            wallet_activity[trader]["last_ts"] = ts
 
-    # Sort by win rate desc
-    qualified.sort(key=lambda x: x["win_rate"], reverse=True)
-    qualified = qualified[:TOP_WALLET_LIMIT]
+    # Score and filter
+    scored = []
+    for addr, data in wallet_activity.items():
+        days_ago = days_since(data["last_ts"]) if data["last_ts"] else 999
+        scored.append({
+            "address":  addr,
+            "trades":   data["count"],
+            "days_ago": days_ago,
+        })
 
-    if not qualified:
-        return (
-            f"⚠️ No wallets found matching:\n"
-            f"• Win rate ≥ {int(MIN_WIN_RATE*100)}%\n"
-            f"• Active within {MAX_INACTIVE_DAYS} days\n"
-            f"• Min {MIN_TRADES} trades\n\n"
-            f"Try a token with more trading history."
-        )
+    # Sort by trade count
+    scored.sort(key=lambda x: x["trades"], reverse=True)
+    top = scored[:TOP_WALLET_LIMIT]
 
-    # Social links from DexScreener
+    # If still empty, try getting token largest accounts
+    if not top:
+        try:
+            from modules.utils import post
+            data = await post(
+                f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
+                json={
+                    "jsonrpc": "2.0", "id": 1,
+                    "method": "getTokenLargestAccounts",
+                    "params": [contract]
+                }
+            )
+            accounts = data.get("result", {}).get("value", [])
+            for acc in accounts[:10]:
+                top.append({
+                    "address":  acc.get("address", ""),
+                    "trades":   0,
+                    "days_ago": 0,
+                    "amount":   acc.get("uiAmount", 0)
+                })
+        except Exception:
+            pass
+
     socials = await find_social_links(contract, dex_info)
 
-    # Build message
-    msg = (
-        f"🏆 *Top Wallets — {token_symbol}*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🪙 {token_name} | {fmt_usd(price)} | MCap: {fmt_usd(mcap)}\n"
-        f"📍 `{contract}`\n"
-        f"✅ Found {len(qualified)} qualifying wallets\n\n"
-    )
-
-    for i, w in enumerate(qualified, 1):
-        addr      = w["address"]
-        win_emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-        active    = "🟢" if w["days_ago"] <= 7 else "🟡"
-
-        msg += (
-            f"{win_emoji} `{short_addr(addr)}`\n"
-            f"   🎯 Win Rate: *{w['win_rate']*100:.1f}%*  {active} {w['days_ago']}d ago\n"
-            f"   📊 Trades: {w['trades']}  💰 PNL: {fmt_usd(w['pnl'])}\n"
-            f"   🔗 [Solscan](https://solscan.io/account/{addr})\n\n"
+    if not top:
+        return (
+            f"Top Wallets - {token_symbol}\n"
+            f"---------------------\n"
+            f"Contract: {short_addr(contract)}\n\n"
+            f"No trader data available for this token yet.\n"
+            f"It may have very low volume or be too new.\n\n"
+            f"Socials:\n{socials}"
         )
 
-    msg += f"*Socials:*\n{socials}"
-    return msg
+    lines = [
+        f"Top Wallets - {token_symbol}",
+        "---------------------",
+        f"Token: {token_name}",
+        f"Price: ${price}  MCap: {fmt_usd(mcap)}",
+        f"Contract: {short_addr(contract)}",
+        f"Found: {len(top)} wallets",
+        "",
+    ]
+
+    for i, w in enumerate(top, 1):
+        addr     = w["address"]
+        days_ago = w.get("days_ago", 0)
+        trades   = w.get("trades", 0)
+        amount   = w.get("amount", 0)
+
+        if days_ago <= 7:    status = "Very Active"
+        elif days_ago <= 20: status = "Active"
+        else:                status = "Inactive"
+
+        lines.append(f"{i}. {short_addr(addr)}")
+        if trades > 0:
+            lines.append(f"   Trades: {trades}  |  {days_ago}d ago ({status})")
+        elif amount > 0:
+            lines.append(f"   Holdings: {amount:,.0f} tokens")
+        lines.append(f"   solscan.io/account/{addr}")
+        lines.append("")
+
+    lines.append(f"Socials:\n{socials}")
+    return "\n".join(lines)
 
 
-# ── EVM top wallets ───────────────────────────────────────────────────────────
 async def _top_evm(contract: str) -> str:
-    # Try ETH first, then BNB
-    for chain in ["eth", "bnb"]:
-        transfers, dex_info = await asyncio.gather(
-            etherscan_token_transfers(contract, chain),
-            dexscreener_token(contract)
+    transfers, chain = [], "eth"
+    for c in ["eth", "bnb"]:
+        t = await etherscan_token_transfers(contract, c)
+        if t:
+            transfers, chain = t, c
+            break
+
+    dex_info     = await dexscreener_token(contract)
+    token_name   = dex_info.get("baseToken", {}).get("name", "Unknown") if dex_info else "Unknown"
+    token_symbol = dex_info.get("baseToken", {}).get("symbol", "???") if dex_info else "???"
+    chain_name   = "Ethereum" if chain == "eth" else "BNB Chain"
+    explorer     = "etherscan.io" if chain == "eth" else "bscscan.com"
+
+    if not transfers:
+        return (
+            f"Top Wallets - {token_symbol} ({chain_name})\n"
+            f"---------------------\n"
+            f"No transfer data found for this contract.\n"
+            f"Check the address or try a token with more activity."
         )
 
-        if transfers:
-            return await _process_evm_transfers(contract, transfers, dex_info, chain)
-
-    return "❌ No transfer data found. Check the contract address or try a different chain."
-
-
-async def _process_evm_transfers(contract, transfers, dex_info, chain) -> str:
-    chain_name = "Ethereum" if chain == "eth" else "BNB Chain"
-    explorer   = "etherscan.io" if chain == "eth" else "bscscan.com"
-    token_name = transfers[0].get("tokenName", "Unknown") if transfers else "Unknown"
-    token_sym  = transfers[0].get("tokenSymbol", "???") if transfers else "???"
-
-    # Aggregate wallet activity
+    # Aggregate wallets
     wallet_data = {}
     for tx in transfers:
         addr = tx.get("to", "").lower()
@@ -138,54 +184,48 @@ async def _process_evm_transfers(contract, transfers, dex_info, chain) -> str:
             continue
         ts = int(tx.get("timeStamp", 0))
         if addr not in wallet_data:
-            wallet_data[addr] = {"buys": 0, "sells": 0, "last_ts": 0, "txs": []}
-        wallet_data[addr]["txs"].append(tx)
+            wallet_data[addr] = {"buys": 0, "last_ts": 0}
+        wallet_data[addr]["buys"] += 1
         if ts > wallet_data[addr]["last_ts"]:
             wallet_data[addr]["last_ts"] = ts
 
-    # Basic win rate estimation: wallets that bought and sold (completed trades)
-    qualified = []
+    # Score
+    scored = []
     for addr, data in wallet_data.items():
         days_ago = days_since(data["last_ts"]) if data["last_ts"] else 999
-        tx_count = len(data["txs"])
+        scored.append({
+            "address":  addr,
+            "trades":   data["buys"],
+            "days_ago": days_ago,
+        })
 
-        if days_ago <= MAX_INACTIVE_DAYS and tx_count >= MIN_TRADES:
-            qualified.append({
-                "address":  addr,
-                "days_ago": days_ago,
-                "trades":   tx_count,
-            })
-
-    # Sort by trade count (proxy for activity)
-    qualified.sort(key=lambda x: x["trades"], reverse=True)
-    qualified = qualified[:TOP_WALLET_LIMIT]
-
-    if not qualified:
-        return (
-            f"⚠️ No active wallets found matching criteria for this {chain_name} token.\n"
-            f"Try a token with more trading history."
-        )
+    scored.sort(key=lambda x: x["trades"], reverse=True)
+    top = scored[:TOP_WALLET_LIMIT]
 
     socials = await find_social_links(contract, dex_info)
 
-    msg = (
-        f"🏆 *Top Wallets — {token_sym}*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🪙 {token_name} ({chain_name})\n"
-        f"📍 `{contract}`\n"
-        f"✅ Found {len(qualified)} active wallets\n\n"
-    )
+    lines = [
+        f"Top Wallets - {token_symbol}",
+        "---------------------",
+        f"Token: {token_name} ({chain_name})",
+        f"Contract: {short_addr(contract)}",
+        f"Found: {len(top)} wallets",
+        "",
+    ]
 
-    for i, w in enumerate(qualified, 1):
-        addr      = w["address"]
-        win_emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-        active    = "🟢" if w["days_ago"] <= 7 else "🟡"
+    for i, w in enumerate(top, 1):
+        addr     = w["address"]
+        days_ago = w["days_ago"]
+        trades   = w["trades"]
 
-        msg += (
-            f"{win_emoji} `{short_addr(addr)}`\n"
-            f"   {active} Active {w['days_ago']}d ago  📊 {w['trades']} txs\n"
-            f"   🔗 [{explorer}](https://{explorer}/address/{addr})\n\n"
-        )
+        if days_ago <= 7:    status = "Very Active"
+        elif days_ago <= 20: status = "Active"
+        else:                status = "Older"
 
-    msg += f"*Socials:*\n{socials}"
-    return msg
+        lines.append(f"{i}. {short_addr(addr)}")
+        lines.append(f"   Trades: {trades}  |  {days_ago}d ago ({status})")
+        lines.append(f"   {explorer}/address/{addr}")
+        lines.append("")
+
+    lines.append(f"Socials:\n{socials}")
+    return "\n".join(lines)
