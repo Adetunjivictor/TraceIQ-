@@ -39,6 +39,3 @@ If it responds, you're live! 🎉
 - Webhook mode (faster than polling)
 
 ---
-
-## ⚠️ After Contest
-Delete your Anthropic API key at console.anthropic.com and generate a new one.
