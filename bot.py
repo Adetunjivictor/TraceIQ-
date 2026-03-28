@@ -1,12 +1,11 @@
 """
 TraceIQ — Wallet Intelligence Bot
-Built for Victor Bliss
+Built for Victor Bliss | @its_vicex
 Modules: PNL Scanner | Top Wallets | Dev Tracker | Social Linking
 """
 
 import logging
-import asyncio
-from telegram import Update, BotCommand
+from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler
@@ -31,7 +30,8 @@ WAITING_FOR_WALLET_SCAN = 4
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
-msg = (
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = (
         "👁 <b>TraceIQ — Wallet Intelligence</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
         "I help you find and analyze high-performance wallets across Solana, ETH/Base &amp; BNB Chain.\n\n"
@@ -44,8 +44,6 @@ msg = (
         "Built by @its_vicex"
     )
     await update.message.reply_text(msg, parse_mode="HTML")
-    )
-    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 # ── /help ─────────────────────────────────────────────────────────────────────
@@ -56,8 +54,8 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── /scan ─────────────────────────────────────────────────────────────────────
 async def scan_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🔍 *Wallet Scanner*\n\nPaste a wallet address to analyze:\n_(Solana, ETH, or BNB)_",
-        parse_mode="Markdown"
+        "🔍 <b>Wallet Scanner</b>\n\nPaste a wallet address to analyze:\n<i>(Solana, ETH, or BNB)</i>",
+        parse_mode="HTML"
     )
     return WAITING_FOR_WALLET_SCAN
 
@@ -77,8 +75,8 @@ async def scan_wallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── /pnl ──────────────────────────────────────────────────────────────────────
 async def pnl_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📸 *PNL Card Scanner*\n\nSend me a PNL card image and I'll extract the wallet address + analyze it.",
-        parse_mode="Markdown"
+        "📸 <b>PNL Card Scanner</b>\n\nSend me a PNL card image and I'll extract the wallet address + analyze it.",
+        parse_mode="HTML"
     )
     return WAITING_FOR_IMAGE
 
@@ -100,8 +98,8 @@ async def pnl_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── /top ──────────────────────────────────────────────────────────────────────
 async def top_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🏆 *Top Wallet Finder*\n\nPaste a token contract address to find the best performing wallets:\n_(80-100% win rate, active 7-20 days)_",
-        parse_mode="Markdown"
+        "🏆 <b>Top Wallet Finder</b>\n\nPaste a token contract address to find the best performing wallets:\n<i>(80-100% win rate, active 7-20 days)</i>",
+        parse_mode="HTML"
     )
     return WAITING_FOR_CONTRACT_TOP
 
@@ -121,8 +119,8 @@ async def top_contract(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── /dev ──────────────────────────────────────────────────────────────────────
 async def dev_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🧑‍💻 *Dev Wallet Tracker*\n\nPaste a token contract address to analyze the deployer wallet:",
-        parse_mode="Markdown"
+        "🧑‍💻 <b>Dev Wallet Tracker</b>\n\nPaste a token contract address to analyze the deployer wallet:",
+        parse_mode="HTML"
     )
     return WAITING_FOR_CONTRACT_DEV
 
@@ -154,7 +152,6 @@ async def error_handler(update, ctx: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Conversation handlers
     scan_conv = ConversationHandler(
         entry_points=[CommandHandler("scan", scan_start)],
         states={WAITING_FOR_WALLET_SCAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, scan_wallet)]},
@@ -187,7 +184,7 @@ def main():
     app.add_handler(dev_conv)
     app.add_error_handler(error_handler)
 
-    logger.info("🚀 TraceIQ is live!")
+    logger.info("TraceIQ is live!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
