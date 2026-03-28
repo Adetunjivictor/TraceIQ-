@@ -31,18 +31,19 @@ WAITING_FOR_WALLET_SCAN = 4
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "👁 *TraceIQ — Wallet Intelligence*\n"
+msg = (
+        "👁 <b>TraceIQ — Wallet Intelligence</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "I help you find and analyze high-performance wallets across Solana, ETH/Base & BNB Chain.\n\n"
-        "*Commands:*\n"
+        "I help you find and analyze high-performance wallets across Solana, ETH/Base &amp; BNB Chain.\n\n"
+        "<b>Commands:</b>\n"
         "🔍 /scan — Analyze a wallet address\n"
         "📸 /pnl — Upload a PNL card to extract wallet\n"
         "🏆 /top — Find top wallets from a token contract\n"
         "🧑‍💻 /dev — Analyze dev wallet of a token\n"
         "❓ /help — Show this menu\n\n"
-        "_Built by @its\\_vicex_"
+        "Built by @its_vicex"
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
