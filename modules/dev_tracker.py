@@ -1,14 +1,17 @@
 """
-TraceIQ — Dev Wallet Tracker Module
-/dev → paste contract → analyze deployer wallet + flag risks
+TraceIQ — Dev Tracker Module (v2)
+/dev → token contract → dev wallet analysis
+Shows: previous deploys, rug history, profitability %, time since each deploy
 """
 
 import asyncio
 from modules.utils import (
     detect_chain, days_since, short_addr, fmt_usd,
     helius_transactions, etherscan_contract_creator,
-    etherscan_txlist, dexscreener_token,
-    find_social_links, claude_analyze
+    etherscan_txlist, etherscan_token_transfers,
+    dexscreener_token, find_social_links, claude_analyze,
+    get, post, HELIUS_API_KEY, HELIUS_API_BASE,
+    ETHERSCAN_BASE, ETHERSCAN_API_KEY, BSCSCAN_BASE, BSCSCAN_API_KEY
 )
 from config import MAX_INACTIVE_DAYS
 
@@ -21,16 +24,16 @@ async def analyze_dev(contract: str) -> str:
         return await _dev_solana(contract)
     elif chain == "evm":
         return await _dev_evm(contract)
-    else:
-        return "❌ Invalid contract address."
+    return "Invalid contract address. Please paste a token contract, not a wallet address."
 
 
-# ── Solana dev analysis ───────────────────────────────────────────────────────
+# ── Solana dev ────────────────────────────────────────────────────────────────
 async def _dev_solana(contract: str) -> str:
-    # On Solana, the mint authority is effectively the "dev"
-    # We use Helius to get mint account info
-    from modules.utils import post, HELIUS_API_KEY
+    dex_info     = await dexscreener_token(contract)
+    token_name   = dex_info.get("baseToken", {}).get("name", "Unknown") if dex_info else "Unknown"
+    token_symbol = dex_info.get("baseToken", {}).get("symbol", "???") if dex_info else "???"
 
+    # Get mint authority (dev wallet)
     try:
         data = await post(
             f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}",
@@ -40,194 +43,279 @@ async def _dev_solana(contract: str) -> str:
                 "params": [contract, {"encoding": "jsonParsed"}]
             }
         )
-        account_info = data.get("result", {}).get("value", {})
-        parsed       = account_info.get("data", {}).get("parsed", {})
-        info         = parsed.get("info", {})
-        mint_auth    = info.get("mintAuthority", None)
-        freeze_auth  = info.get("freezeAuthority", None)
-        supply       = int(info.get("supply", 0))
-        decimals     = int(info.get("decimals", 6))
-        actual_supply = supply / (10 ** decimals)
+        info      = data.get("result", {}).get("value", {}).get("data", {}).get("parsed", {}).get("info", {})
+        dev_addr  = info.get("mintAuthority") or info.get("updateAuthority", "")
+        supply    = int(info.get("supply", 0))
+        decimals  = int(info.get("decimals", 6))
+        actual_supply = supply / (10 ** decimals) if supply else 0
     except Exception:
-        mint_auth = None
-        freeze_auth = None
+        dev_addr = ""
         actual_supply = 0
 
-    dex_info = await dexscreener_token(contract)
-    token_name   = dex_info.get("baseToken", {}).get("name", "Unknown")
-    token_symbol = dex_info.get("baseToken", {}).get("symbol", "???")
+    # Try to find dev from DexScreener if mint auth revoked
+    if not dev_addr:
+        # Check transactions to find the original deployer
+        try:
+            txs = await helius_transactions(contract, limit=10)
+            if txs:
+                # Last transaction in list is usually oldest = deployer
+                dev_addr = txs[-1].get("feePayer", "")
+        except Exception:
+            pass
 
-    if not mint_auth:
-        # Mint authority revoked — good sign
-        msg = (
-            f"🧑‍💻 *Dev Analysis — {token_symbol}*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🪙 {token_name}\n"
-            f"📍 `{contract}`\n\n"
-            f"✅ *Mint authority: REVOKED*\n"
-            f"Dev cannot mint new tokens. This is a positive safety signal.\n\n"
+    if not dev_addr:
+        return (
+            f"Dev Analysis - {token_symbol}\n"
+            f"---------------------\n"
+            f"Could not identify deployer wallet.\n"
+            f"Mint authority may be revoked (good sign).\n\n"
+            f"Token: {token_name}\n"
+            f"Contract: {short_addr(contract)}\n"
         )
-        if freeze_auth:
-            msg += f"⚠️ Freeze authority still active: `{short_addr(freeze_auth)}`\n\n"
-        else:
-            msg += f"✅ Freeze authority: REVOKED\n\n"
 
-        socials = await find_social_links(contract, dex_info)
-        msg += f"*Socials:*\n{socials}"
-        return msg
+    return await _analyze_solana_dev_wallet(dev_addr, contract, token_name, token_symbol, dex_info)
 
-    # Analyze mint authority wallet
-    dev_addr = mint_auth
-    txs      = await helius_transactions(dev_addr, limit=50)
+
+async def _analyze_solana_dev_wallet(dev_addr, contract, token_name, token_symbol, dex_info):
+    # Get dev transactions
+    txs = await helius_transactions(dev_addr, limit=100)
 
     last_ts  = txs[0].get("timestamp", 0) if txs else 0
     days_ago = days_since(last_ts) if last_ts else 999
-
-    if days_ago <= 7:
-        active_tag = "🟢 Very Active"
-    elif days_ago <= MAX_INACTIVE_DAYS:
-        active_tag = "🟡 Active"
-    else:
-        active_tag = "🔴 Inactive (>20 days)"
-
     total_txs = len(txs)
 
-    # Risk flags
-    flags = []
-    if freeze_auth:
-        flags.append("⚠️ Freeze authority active — dev can freeze wallets")
-    if days_ago > MAX_INACTIVE_DAYS:
-        flags.append("⚠️ Dev inactive for 20+ days — potential abandon risk")
-    if total_txs < 5:
-        flags.append("⚠️ Very few transactions — new or fresh wallet")
+    # Find other tokens this dev created (look for token mint instructions)
+    other_tokens = []
+    for tx in txs:
+        for transfer in tx.get("tokenTransfers", []):
+            mint = transfer.get("mint", "")
+            if mint and mint != contract and mint not in [t["mint"] for t in other_tokens]:
+                other_tokens.append({
+                    "mint": mint,
+                    "ts": tx.get("timestamp", 0)
+                })
 
-    # AI risk assessment
-    ai_prompt = f"""You are TraceIQ, a crypto wallet intelligence bot analyzing a token deployer.
+    other_tokens = other_tokens[:10]
 
-Token: {token_name} ({token_symbol}) on Solana
-Dev wallet: {dev_addr}
-Last active: {days_ago} days ago
-Recent transactions: {total_txs}
-Mint authority: ACTIVE (dev can still mint tokens)
-Freeze authority: {"ACTIVE" if freeze_auth else "revoked"}
-Supply: {actual_supply:,.0f} tokens
+    # Profitability: estimate from SOL transfers
+    sol_received = 0
+    sol_sent     = 0
+    for tx in txs:
+        for nt in tx.get("nativeTransfers", []):
+            amt = nt.get("amount", 0) / 1e9
+            if nt.get("toUserAccount") == dev_addr:
+                sol_received += amt
+            elif nt.get("fromUserAccount") == dev_addr:
+                sol_sent += amt
 
-Give a 2-3 sentence risk assessment of this developer. Be direct and useful for a crypto trader deciding whether to buy this token."""
+    net_sol    = sol_received - sol_sent
+    profit_pct = round((net_sol / sol_sent * 100), 1) if sol_sent > 0 else 0
 
+    # Activity status
+    if days_ago <= 7:    active_tag = "Very Active"
+    elif days_ago <= 20: active_tag = "Active"
+    else:                active_tag = "Inactive"
+
+    # Rug risk heuristic
+    rug_signals = []
+    if len(other_tokens) > 5:
+        rug_signals.append(f"Deployed {len(other_tokens)}+ tokens (serial launcher risk)")
+    if days_ago > 30:
+        rug_signals.append("Dev has been inactive for 30+ days")
+    if sol_sent > sol_received * 2:
+        rug_signals.append("High outbound SOL (possible liquidity drain)")
+
+    # AI assessment
+    ai_prompt = (
+        f"You are TraceIQ analyzing a Solana token developer. "
+        f"Token: {token_name} ({token_symbol}). "
+        f"Dev wallet: {dev_addr}. "
+        f"Dev last active: {days_ago} days ago. "
+        f"Total transactions: {total_txs}. "
+        f"Other tokens found in wallet: {len(other_tokens)}. "
+        f"Net SOL flow: {net_sol:.2f} SOL. "
+        f"Estimated profitability: {profit_pct}%. "
+        f"Rug signals: {rug_signals if rug_signals else 'none detected'}. "
+        f"Write 3 sentences max. Is this dev trustworthy? What is the risk level? Be direct and specific."
+    )
     ai_summary = await claude_analyze(ai_prompt)
     socials    = await find_social_links(contract, dex_info)
 
-    msg = (
-        f"🧑‍💻 *Dev Analysis — {token_symbol}*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🪙 {token_name} | Solana\n"
-        f"📍 Contract: `{short_addr(contract)}`\n\n"
-        f"*Deployer Wallet:*\n"
-        f"📍 `{dev_addr}`\n"
-        f"📅 Last Active: {days_ago}d ago  {active_tag}\n"
-        f"📊 Recent Txs: {total_txs}\n"
-        f"🔑 Mint Auth: ⚠️ ACTIVE\n"
-        f"❄️ Freeze Auth: {'⚠️ ACTIVE' if freeze_auth else '✅ Revoked'}\n\n"
-    )
+    lines = [
+        f"Dev Analysis - {token_symbol}",
+        "---------------------",
+        f"Token: {token_name}",
+        f"Contract: {short_addr(contract)}",
+        "",
+        "Developer Wallet",
+        f"Address: {dev_addr}",
+        f"Last Active: {days_ago} days ago ({active_tag})",
+        f"Total Txs: {total_txs}",
+        f"Profitability: {profit_pct}%",
+        f"Other Tokens Deployed: {len(other_tokens)}",
+        "",
+    ]
 
-    if flags:
-        msg += "*⚠️ Risk Flags:*\n"
-        for f in flags:
-            msg += f"{f}\n"
-        msg += "\n"
+    if other_tokens:
+        lines.append("Previous Deploys:")
+        for i, t in enumerate(other_tokens[:5], 1):
+            d = days_since(t["ts"]) if t["ts"] else "?"
+            lines.append(f"  {i}. {short_addr(t['mint'])}  ({d}d ago)")
+            lines.append(f"     solscan.io/token/{t['mint']}")
+        lines.append("")
 
-    msg += f"*🤖 AI Risk Assessment:*\n_{ai_summary}_\n\n"
-    msg += f"🔗 [View Dev on Solscan](https://solscan.io/account/{dev_addr})\n\n"
-    msg += f"*Socials:*\n{socials}"
+    if rug_signals:
+        lines.append("Risk Flags:")
+        for r in rug_signals:
+            lines.append(f"  - {r}")
+        lines.append("")
+    else:
+        lines.append("Risk Flags: None detected")
+        lines.append("")
 
-    return msg
+    lines += [
+        "AI Assessment:",
+        ai_summary,
+        "",
+        f"View Dev: solscan.io/account/{dev_addr}",
+        "",
+        f"Socials:\n{socials}"
+    ]
+    return "\n".join(lines)
 
 
-# ── EVM dev analysis ──────────────────────────────────────────────────────────
+# ── EVM dev ───────────────────────────────────────────────────────────────────
 async def _dev_evm(contract: str) -> str:
-    # Try ETH then BNB
-    for chain in ["eth", "bnb"]:
-        dev_addr = await etherscan_contract_creator(contract, chain)
-        if dev_addr:
-            return await _analyze_evm_dev(contract, dev_addr, chain)
+    dev_addr, chain = "", "eth"
+    for c in ["eth", "bnb"]:
+        addr = await etherscan_contract_creator(contract, c)
+        if addr:
+            dev_addr, chain = addr, c
+            break
 
-    return "❌ Could not find deployer wallet. Check the contract address."
+    dex_info     = await dexscreener_token(contract)
+    token_name   = dex_info.get("baseToken", {}).get("name", "Unknown") if dex_info else "Unknown"
+    token_symbol = dex_info.get("baseToken", {}).get("symbol", "???") if dex_info else "???"
+    chain_name   = "Ethereum" if chain == "eth" else "BNB Chain"
+    explorer     = "etherscan.io" if chain == "eth" else "bscscan.com"
+    base_url     = ETHERSCAN_BASE if chain == "eth" else BSCSCAN_BASE
+    api_key      = ETHERSCAN_API_KEY if chain == "eth" else BSCSCAN_API_KEY
 
+    if not dev_addr:
+        return (
+            f"Dev Analysis - {token_symbol}\n"
+            f"---------------------\n"
+            f"Could not find deployer wallet.\n"
+            f"Check the contract address is correct."
+        )
 
-async def _analyze_evm_dev(contract: str, dev_addr: str, chain: str) -> str:
-    chain_name = "Ethereum" if chain == "eth" else "BNB Chain"
-    explorer   = "etherscan.io" if chain == "eth" else "bscscan.com"
+    # Get dev transactions
+    dev_txs = await etherscan_txlist(dev_addr, chain)
 
-    dev_txs, dex_info = await asyncio.gather(
-        etherscan_txlist(dev_addr, chain),
-        dexscreener_token(contract)
-    )
-
-    token_name   = dex_info.get("baseToken", {}).get("name", "Unknown")
-    token_symbol = dex_info.get("baseToken", {}).get("symbol", "???")
-
-    last_ts  = int(dev_txs[0].get("timeStamp", 0)) if dev_txs else 0
-    days_ago = days_since(last_ts) if last_ts else 999
+    last_ts   = int(dev_txs[0].get("timeStamp", 0)) if dev_txs else 0
+    days_ago  = days_since(last_ts) if last_ts else 999
     total_txs = len(dev_txs)
 
-    if days_ago <= 7:
-        active_tag = "🟢 Very Active"
-    elif days_ago <= MAX_INACTIVE_DAYS:
-        active_tag = "🟡 Active"
-    else:
-        active_tag = "🔴 Inactive"
+    # Find other contracts deployed by this dev
+    prev_deploys = []
+    for tx in dev_txs:
+        ca = tx.get("contractAddress", "")
+        if ca and ca.lower() != contract.lower():
+            ts = int(tx.get("timeStamp", 0))
+            prev_deploys.append({"address": ca, "ts": ts})
 
-    # Count unique contracts deployed by this dev
-    contracts_deployed = set(
-        tx.get("contractAddress", "") for tx in dev_txs
-        if tx.get("contractAddress")
+    prev_deploys = prev_deploys[:10]
+
+    # Profitability: ETH/BNB in vs out
+    eth_in  = sum(int(t.get("value", 0)) for t in dev_txs if t.get("to", "").lower() == dev_addr.lower())
+    eth_out = sum(int(t.get("value", 0)) for t in dev_txs if t.get("from", "").lower() == dev_addr.lower())
+    net_eth = (eth_in - eth_out) / 1e18
+    profit_pct = round((net_eth / (eth_out / 1e18) * 100), 1) if eth_out > 0 else 0
+
+    if days_ago <= 7:    active_tag = "Very Active"
+    elif days_ago <= 20: active_tag = "Active"
+    else:                active_tag = "Inactive"
+
+    # Rug signals
+    rug_signals = []
+    if len(prev_deploys) > 5:
+        rug_signals.append(f"Deployed {len(prev_deploys)}+ contracts (serial launcher)")
+    if days_ago > 30:
+        rug_signals.append("Dev inactive for 30+ days")
+    if eth_out > eth_in * 2:
+        rug_signals.append("High outbound ETH/BNB (possible drain)")
+
+    # Check each previous deploy for rug patterns via DexScreener
+    rug_count = 0
+    for d in prev_deploys[:5]:
+        try:
+            info = await dexscreener_token(d["address"])
+            if info:
+                liq = float(info.get("liquidity", {}).get("usd", 0))
+                if liq < 100:
+                    rug_count += 1
+        except Exception:
+            pass
+
+    if rug_count > 0:
+        rug_signals.append(f"{rug_count} previous token(s) have near-zero liquidity (likely rugged)")
+
+    ai_prompt = (
+        f"You are TraceIQ analyzing a {chain_name} token developer. "
+        f"Token: {token_name} ({token_symbol}). "
+        f"Dev wallet: {dev_addr}. "
+        f"Last active: {days_ago} days ago. "
+        f"Total transactions: {total_txs}. "
+        f"Previous contracts deployed: {len(prev_deploys)}. "
+        f"Estimated profitability: {profit_pct}%. "
+        f"Rug signals: {rug_signals if rug_signals else 'none'}. "
+        f"Tokens with near-zero liquidity: {rug_count}. "
+        f"Write 3 sentences. Is this dev trustworthy? What is the risk? Be direct."
     )
-
-    # Risk flags
-    flags = []
-    if days_ago > MAX_INACTIVE_DAYS:
-        flags.append("⚠️ Dev inactive for 20+ days")
-    if len(contracts_deployed) > 5:
-        flags.append(f"⚠️ Dev deployed {len(contracts_deployed)} contracts — serial launcher risk")
-    if total_txs < 5:
-        flags.append("⚠️ Very few transactions — fresh wallet")
-
-    # AI assessment
-    ai_prompt = f"""You are TraceIQ, a crypto wallet intelligence bot analyzing a token deployer.
-
-Token: {token_name} ({token_symbol}) on {chain_name}
-Dev wallet: {dev_addr}
-Last active: {days_ago} days ago
-Recent transactions: {total_txs}
-Other contracts deployed by this wallet: {len(contracts_deployed)}
-
-Give a 2-3 sentence risk assessment of this developer. Be direct and useful for a crypto trader."""
-
     ai_summary, socials = await asyncio.gather(
         claude_analyze(ai_prompt),
         find_social_links(contract, dex_info)
     )
 
-    msg = (
-        f"🧑‍💻 *Dev Analysis — {token_symbol}*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🪙 {token_name} | {chain_name}\n"
-        f"📍 Contract: `{short_addr(contract)}`\n\n"
-        f"*Deployer Wallet:*\n"
-        f"📍 `{dev_addr}`\n"
-        f"📅 Last Active: {days_ago}d ago  {active_tag}\n"
-        f"📊 Recent Txs: {total_txs}\n"
-        f"🏭 Contracts Deployed: {len(contracts_deployed)}\n\n"
-    )
+    lines = [
+        f"Dev Analysis - {token_symbol}",
+        "---------------------",
+        f"Token: {token_name} ({chain_name})",
+        f"Contract: {short_addr(contract)}",
+        "",
+        "Developer Wallet",
+        f"Address: {dev_addr}",
+        f"Last Active: {days_ago} days ago ({active_tag})",
+        f"Total Txs: {total_txs}",
+        f"Profitability: {profit_pct}%",
+        f"Previous Deploys: {len(prev_deploys)}",
+        f"Suspected Rugs: {rug_count}",
+        "",
+    ]
 
-    if flags:
-        msg += "*⚠️ Risk Flags:*\n"
-        for f in flags:
-            msg += f"{f}\n"
-        msg += "\n"
+    if prev_deploys:
+        lines.append("Previous Tokens Deployed:")
+        for i, d in enumerate(prev_deploys[:5], 1):
+            age = days_since(d["ts"]) if d["ts"] else "?"
+            lines.append(f"  {i}. {short_addr(d['address'])}  ({age} days ago)")
+            lines.append(f"     {explorer}/address/{d['address']}")
+        lines.append("")
 
-    msg += f"*🤖 AI Risk Assessment:*\n_{ai_summary}_\n\n"
-    msg += f"🔗 [View Dev on {explorer}](https://{explorer}/address/{dev_addr})\n\n"
-    msg += f"*Socials:*\n{socials}"
+    if rug_signals:
+        lines.append("Risk Flags:")
+        for r in rug_signals:
+            lines.append(f"  - {r}")
+        lines.append("")
+    else:
+        lines.append("Risk Flags: None detected")
+        lines.append("")
 
-    return msg
+    lines += [
+        "AI Assessment:",
+        ai_summary,
+        "",
+        f"View Dev: {explorer}/address/{dev_addr}",
+        "",
+        f"Socials:\n{socials}"
+    ]
+    return "\n".join(lines)
