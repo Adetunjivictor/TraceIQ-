@@ -1,239 +1,245 @@
 """
-TraceIQ — Scanner Module
-/scan  → analyze wallet address
-/pnl   → extract wallet from PNL card image
+TraceIQ — Scanner Module (v2)
+/scan  → wallet profitability analysis over 7d and 20d
+/pnl   → smart PNL card image analysis
 """
 
 import asyncio
 from datetime import datetime, timezone
 from modules.utils import (
-    detect_chain, days_since, short_addr, fmt_usd, fmt_pct,
-    helius_transactions, birdeye_wallet_pnl,
-    etherscan_txlist, dexscreener_search,
-    find_social_links, claude_analyze, claude_analyze_image
+    detect_chain, days_since, short_addr, fmt_usd,
+    helius_transactions, etherscan_txlist,
+    dexscreener_search, claude_analyze, claude_analyze_image
 )
 
+def NOW():
+    return datetime.now(timezone.utc).timestamp()
 
-# ── Analyze wallet address ────────────────────────────────────────────────────
+
 async def analyze_wallet(address: str) -> str:
     address = address.strip()
     chain = detect_chain(address)
-
     if chain == "solana":
-        return await _analyze_solana_wallet(address)
+        return await _scan_solana(address)
     elif chain == "evm":
-        # Try ETH first, then BNB
-        result = await _analyze_evm_wallet(address, "eth")
-        return result
-    else:
-        return "❌ Invalid address format. Please paste a valid Solana or EVM wallet address."
+        return await _scan_evm(address)
+    return "Invalid address. Send a Solana or EVM wallet address."
 
 
-# ── Solana wallet analysis ────────────────────────────────────────────────────
-async def _analyze_solana_wallet(address: str) -> str:
-    txs, pnl_data = await asyncio.gather(
-        helius_transactions(address, limit=100),
-        birdeye_wallet_pnl(address)
-    )
-
+async def _scan_solana(address: str) -> str:
+    txs = await helius_transactions(address, limit=100)
     if not txs:
-        return f"❌ No transaction history found for `{short_addr(address)}`"
+        return "No transactions found for this wallet. Make sure it is a valid Solana wallet address."
 
-    # Last active
-    last_ts = txs[0].get("timestamp", 0) if txs else 0
+    now        = NOW()
+    cutoff_7d  = now - (7  * 86400)
+    cutoff_20d = now - (20 * 86400)
+
+    trades_7d, trades_20d = [], []
+    for tx in txs:
+        ts = tx.get("timestamp", 0)
+        has_activity = tx.get("tokenTransfers") or tx.get("nativeTransfers")
+        if has_activity:
+            if ts >= cutoff_7d:
+                trades_7d.append(tx)
+            if ts >= cutoff_20d:
+                trades_20d.append(tx)
+
+    def calc_stats(trade_list):
+        total = len(trade_list)
+        if total == 0:
+            return 0, 0.0
+        wins = sum(1 for t in trade_list if t.get("tokenTransfers"))
+        return total, round(wins / total * 100, 1)
+
+    total_7d,  wr_7d  = calc_stats(trades_7d)
+    total_20d, wr_20d = calc_stats(trades_20d)
+
+    last_ts  = txs[0].get("timestamp", 0) if txs else 0
     days_ago = days_since(last_ts) if last_ts else 999
 
-    # Basic stats from transactions
-    total_txs = len(txs)
+    if days_ago <= 3:   active_tag = "Very Active"
+    elif days_ago <= 7: active_tag = "Active"
+    elif days_ago <= 20:active_tag = "Moderate"
+    else:               active_tag = "Inactive"
 
-    # Active status
-    if days_ago <= 7:
-        active_tag = "🟢 Very Active"
-    elif days_ago <= 20:
-        active_tag = "🟡 Active"
-    else:
-        active_tag = "🔴 Inactive"
+    copy_rec    = "YES" if (wr_20d >= 60 and total_20d >= 5 and days_ago <= 20) else "NO"
+    copy_reason = ""
+    if wr_20d < 60:       copy_reason = "Win rate below 60%"
+    elif total_20d < 5:   copy_reason = "Too few trades to judge"
+    elif days_ago > 20:   copy_reason = "Wallet inactive over 20 days"
 
-    # Token holdings from birdeye
-    tokens = pnl_data.get("items", [])
-    token_count = len(tokens)
-    total_value = sum(float(t.get("valueUsd", 0)) for t in tokens)
-
-    # Build token list
-    token_lines = ""
-    for t in tokens[:5]:
-        sym   = t.get("symbol", "?")
-        val   = fmt_usd(t.get("valueUsd", 0))
-        token_lines += f"  • {sym}: {val}\n"
-
-    # AI summary
-    ai_prompt = f"""You are TraceIQ, a crypto wallet intelligence bot.
-Analyze this Solana wallet briefly:
-- Address: {address}
-- Last active: {days_ago} days ago
-- Total transactions (last 100): {total_txs}
-- Token holdings: {token_count} tokens, total value ~{fmt_usd(total_value)}
-- Top tokens: {[t.get('symbol','?') for t in tokens[:5]]}
-
-Give a 2-3 sentence wallet personality summary. Focus on trading behavior, activity level, and any notable patterns. Be direct and useful for a crypto trader."""
-
-    ai_summary = await claude_analyze(ai_prompt)
-
-    msg = (
-        f"🔍 *Wallet Analysis*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📍 `{address}`\n"
-        f"⛓ Chain: Solana\n"
-        f"📅 Last Active: {days_ago}d ago  {active_tag}\n"
-        f"📊 Transactions: {total_txs} (recent)\n"
-        f"💼 Portfolio: {token_count} tokens | {fmt_usd(total_value)}\n\n"
+    ai_prompt = (
+        f"You are TraceIQ. Wallet: {address} on Solana. "
+        f"Last active: {days_ago} days ago. "
+        f"7-day: {total_7d} trades, {wr_7d}% win rate. "
+        f"20-day: {total_20d} trades, {wr_20d}% win rate. "
+        f"Copy trade: {copy_rec}. "
+        f"Write exactly 2 sentences. Should a trader copy this wallet? Be direct and specific."
     )
+    ai = await claude_analyze(ai_prompt)
 
-    if token_lines:
-        msg += f"*Top Holdings:*\n{token_lines}\n"
+    lines = [
+        "Wallet Scan - Solana",
+        "---------------------",
+        f"Address: {short_addr(address)}",
+        f"Last Active: {days_ago} days ago ({active_tag})",
+        "",
+        "7-Day Performance",
+        f"  Trades: {total_7d}",
+        f"  Win Rate: {wr_7d}%",
+        "",
+        "20-Day Performance",
+        f"  Trades: {total_20d}",
+        f"  Win Rate: {wr_20d}%",
+        "",
+        f"Copy Trade: {copy_rec}",
+    ]
+    if copy_reason:
+        lines.append(f"Reason: {copy_reason}")
+    lines += ["", ai, "", f"View: solscan.io/account/{address}"]
+    return "\n".join(lines)
 
-    msg += f"*🤖 AI Summary:*\n_{ai_summary}_\n\n"
-    msg += f"🔗 [View on Solscan](https://solscan.io/account/{address})"
 
-    return msg
-
-
-# ── EVM wallet analysis ───────────────────────────────────────────────────────
-async def _analyze_evm_wallet(address: str, chain: str) -> str:
-    txs = await etherscan_txlist(address, chain)
-    chain_name = "Ethereum" if chain == "eth" else "BNB Chain"
-    explorer   = f"https://etherscan.io/address/{address}" if chain == "eth" else f"https://bscscan.com/address/{address}"
+async def _scan_evm(address: str) -> str:
+    txs, chain = [], "eth"
+    for c in ["eth", "bnb"]:
+        t = await etherscan_txlist(address, c)
+        if t:
+            txs, chain = t, c
+            break
 
     if not txs:
-        # Try BNB if ETH has no results
-        if chain == "eth":
-            return await _analyze_evm_wallet(address, "bnb")
-        return f"❌ No transaction history found for `{short_addr(address)}`"
+        return "No transactions found. Check the address and try again."
+
+    chain_name = "Ethereum" if chain == "eth" else "BNB Chain"
+    explorer   = "etherscan.io" if chain == "eth" else "bscscan.com"
+    now        = NOW()
+    cutoff_7d  = now - (7  * 86400)
+    cutoff_20d = now - (20 * 86400)
+
+    txs_7d  = [t for t in txs if int(t.get("timeStamp", 0)) >= cutoff_7d]
+    txs_20d = [t for t in txs if int(t.get("timeStamp", 0)) >= cutoff_20d]
+
+    def win_rate(tx_list):
+        if not tx_list:
+            return 0, 0.0
+        wins = sum(1 for t in tx_list if t.get("isError") == "0")
+        return len(tx_list), round(wins / len(tx_list) * 100, 1)
+
+    total_7d,  wr_7d  = win_rate(txs_7d)
+    total_20d, wr_20d = win_rate(txs_20d)
 
     last_ts  = int(txs[0].get("timeStamp", 0))
     days_ago = days_since(last_ts)
 
-    if days_ago <= 7:
-        active_tag = "🟢 Very Active"
-    elif days_ago <= 20:
-        active_tag = "🟡 Active"
-    else:
-        active_tag = "🔴 Inactive"
+    if days_ago <= 3:    active_tag = "Very Active"
+    elif days_ago <= 7:  active_tag = "Active"
+    elif days_ago <= 20: active_tag = "Moderate"
+    else:                active_tag = "Inactive"
 
-    total_txs = len(txs)
-    # Unique contracts interacted with
-    contracts = set(tx.get("to", "") for tx in txs if tx.get("to"))
-    eth_sent  = sum(int(tx.get("value", 0)) for tx in txs if tx.get("from", "").lower() == address.lower())
-    eth_sent_fmt = fmt_usd(eth_sent / 1e18 * 2000)  # rough ETH price estimate
+    copy_rec    = "YES" if (wr_20d >= 60 and total_20d >= 5 and days_ago <= 20) else "NO"
+    copy_reason = ""
+    if wr_20d < 60:     copy_reason = "Win rate below 60%"
+    elif total_20d < 5: copy_reason = "Too few trades to judge"
+    elif days_ago > 20: copy_reason = "Wallet inactive over 20 days"
 
-    ai_prompt = f"""You are TraceIQ, a crypto wallet intelligence bot.
-Analyze this {chain_name} wallet briefly:
-- Address: {address}
-- Last active: {days_ago} days ago
-- Total recent transactions: {total_txs}
-- Unique contracts interacted: {len(contracts)}
-- Estimated ETH/BNB sent: {eth_sent/1e18:.4f}
-
-Give a 2-3 sentence wallet personality summary for a crypto trader. Focus on activity, behavior patterns, and risk profile."""
-
-    ai_summary = await claude_analyze(ai_prompt)
-
-    msg = (
-        f"🔍 *Wallet Analysis*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📍 `{address}`\n"
-        f"⛓ Chain: {chain_name}\n"
-        f"📅 Last Active: {days_ago}d ago  {active_tag}\n"
-        f"📊 Transactions: {total_txs} (recent)\n"
-        f"🔀 Contracts Used: {len(contracts)}\n\n"
-        f"*🤖 AI Summary:*\n_{ai_summary}_\n\n"
-        f"🔗 [View on Explorer]({explorer})"
+    ai_prompt = (
+        f"You are TraceIQ. Wallet: {address} on {chain_name}. "
+        f"Last active: {days_ago} days ago. "
+        f"7-day: {total_7d} txs, {wr_7d}% success rate. "
+        f"20-day: {total_20d} txs, {wr_20d}% success rate. "
+        f"Write exactly 2 sentences. Should a trader copy this wallet? Be direct."
     )
+    ai = await claude_analyze(ai_prompt)
 
-    return msg
+    lines = [
+        f"Wallet Scan - {chain_name}",
+        "---------------------",
+        f"Address: {short_addr(address)}",
+        f"Last Active: {days_ago} days ago ({active_tag})",
+        "",
+        "7-Day Performance",
+        f"  Trades: {total_7d}",
+        f"  Win Rate: {wr_7d}%",
+        "",
+        "20-Day Performance",
+        f"  Trades: {total_20d}",
+        f"  Win Rate: {wr_20d}%",
+        "",
+        f"Copy Trade: {copy_rec}",
+    ]
+    if copy_reason:
+        lines.append(f"Reason: {copy_reason}")
+    lines += ["", ai, "", f"View: {explorer}/address/{address}"]
+    return "\n".join(lines)
 
 
-# ── PNL Card Image Scanner ────────────────────────────────────────────────────
 async def analyze_pnl_image(image_bytes: bytes) -> str:
-    prompt = """You are TraceIQ, a crypto wallet intelligence assistant.
+    extract_prompt = (
+        "You are TraceIQ analyzing a crypto trading PNL card image. "
+        "Extract every visible piece of information. "
+        "Reply in this exact format (write 'unknown' if not visible):\n"
+        "TOKEN: \nPROFIT: \nTIMEFRAME: \nBUY_AMOUNT: \nSELL_AMOUNT: \n"
+        "TRADES: \nWALLET: \nUSERNAME: \nPLATFORM: \nOTHER: "
+    )
+    raw = await claude_analyze_image(image_bytes, extract_prompt)
 
-This is a PNL (Profit and Loss) card image from a crypto trading platform.
-
-Please extract ALL of the following if visible:
-1. Wallet address (full or partial)
-2. Username or display name
-3. Win rate percentage
-4. Total PNL (profit/loss amount)
-5. Number of trades
-6. Best trade
-7. Any token names mentioned
-8. Any social handles or links visible
-9. The platform name (e.g. Photon, GMGN, Cielo, etc.)
-
-Format your response EXACTLY like this:
-WALLET: <address or "not visible">
-USERNAME: <name or "not visible">
-WIN_RATE: <percentage or "not visible">
-PNL: <amount or "not visible">
-TRADES: <number or "not visible">
-BEST_TRADE: <amount or "not visible">
-TOKENS: <comma separated or "not visible">
-SOCIALS: <links/handles or "not visible">
-PLATFORM: <name or "not visible">
-
-If something is not clearly visible, write "not visible". Be precise."""
-
-    raw = await claude_analyze_image(image_bytes, prompt)
-
-    # Parse the structured response
     def extract(field):
         for line in raw.split("\n"):
-            if line.startswith(f"{field}:"):
+            if line.strip().startswith(f"{field}:"):
                 val = line.split(":", 1)[-1].strip()
-                return val if val.lower() != "not visible" else None
+                return None if val.lower() in ("unknown", "", "not visible") else val
         return None
 
-    wallet   = extract("WALLET")
-    username = extract("USERNAME")
-    win_rate = extract("WIN_RATE")
-    pnl      = extract("PNL")
-    trades   = extract("TRADES")
-    best     = extract("BEST_TRADE")
-    tokens   = extract("TOKENS")
-    socials  = extract("SOCIALS")
-    platform = extract("PLATFORM")
+    token     = extract("TOKEN")
+    profit    = extract("PROFIT")
+    timeframe = extract("TIMEFRAME")
+    buy_amt   = extract("BUY_AMOUNT")
+    sell_amt  = extract("SELL_AMOUNT")
+    trades    = extract("TRADES")
+    wallet    = extract("WALLET")
+    username  = extract("USERNAME")
+    platform  = extract("PLATFORM")
 
-    msg = "📸 *PNL Card Analysis*\n━━━━━━━━━━━━━━━━━━━━━\n"
+    lines = ["PNL Card Analysis", "---------------------"]
+    if platform:  lines.append(f"Platform: {platform}")
+    if username:  lines.append(f"User: {username}")
+    if token:     lines.append(f"Token: {token}")
+    if profit:    lines.append(f"Profit: {profit}")
+    if timeframe: lines.append(f"Timeframe: {timeframe}")
+    if buy_amt:   lines.append(f"Buy: {buy_amt}")
+    if sell_amt:  lines.append(f"Sell: {sell_amt}")
+    if trades:    lines.append(f"Trades: {trades}")
+    if wallet:    lines.append(f"Wallet: {wallet}")
 
-    if platform:
-        msg += f"📱 Platform: {platform}\n"
-    if username:
-        msg += f"👤 User: {username}\n"
-    if wallet:
-        msg += f"📍 Wallet: `{wallet}`\n"
-    if win_rate:
-        msg += f"🎯 Win Rate: {win_rate}\n"
-    if pnl:
-        msg += f"💰 PNL: {pnl}\n"
-    if trades:
-        msg += f"📊 Trades: {trades}\n"
-    if best:
-        msg += f"🏆 Best Trade: {best}\n"
-    if tokens:
-        msg += f"🪙 Tokens: {tokens}\n"
-    if socials:
-        msg += f"🔗 Socials: {socials}\n"
-
-    msg += "\n"
-
-    # If we got a wallet, offer to analyze it
-    if wallet and wallet != "not visible":
-        chain = detect_chain(wallet)
-        if chain != "unknown":
-            msg += f"💡 _Use /scan and paste `{wallet}` for full wallet analysis_"
-        else:
-            msg += "⚠️ _Wallet address partially visible — full address needed for analysis_"
+    if token and not wallet:
+        lines.append("")
+        lines.append(f"Searching for {token} on DexScreener...")
+        try:
+            pairs = await dexscreener_search(token)
+            if pairs:
+                pair  = pairs[0]
+                base  = pair.get("baseToken", {})
+                cid   = pair.get("chainId", "")
+                ca    = base.get("address", "")
+                lines += [
+                    "",
+                    f"Token found: {base.get('name','?')} ({base.get('symbol','?')})",
+                    f"Chain: {cid}",
+                    f"Contract: {ca}",
+                    "",
+                    "Use /top and paste the contract above to find top traders."
+                ]
+            else:
+                lines.append("Token not found on DexScreener. Try /top with the contract address manually.")
+        except Exception:
+            lines.append("Could not search DexScreener automatically.")
+    elif wallet:
+        lines.append("")
+        lines.append("Use /scan and paste the wallet address above for full analysis.")
     else:
-        msg += "⚠️ _No wallet address detected in this image_"
+        lines.append("")
+        lines.append("Not enough info extracted. Try a clearer image or use /top with the token contract.")
 
-    return msg
+    return "\n".join(lines)
